@@ -128,11 +128,18 @@ jobs:
         with:
           tag_name: ${{ steps.release_tag.outputs.tag }}
           name: Open-Box firmware ${{ steps.release_tag.outputs.tag }}
+          # 必须标成 prerelease。原因:GitHub 的 releases/latest 会跳过 prerelease,
+          # 而 scripts/install.sh 正是靠 releases/latest/download/open-box-linux-arm64.tar.gz
+          # 拿 overlay 安装包的。固件 Release 如果不标,就会顶掉 latest,让"一键安装"
+          # 直接 404——等于用一个能刷机的产物把另一条安装路径弄坏了。
+          prerelease: true
           body: |
             烘焙进 ImmortalWrt 固件的 Open-Box（profile `${{ github.event.inputs.profile || 'redmi_ax6' }}`）。
 
             Open-Box 程序本体在只读 squashfs 里，xz 压缩，不占 overlay，且不使用 UPX。
             刷机方式与普通 ImmortalWrt 固件相同；注意 profile 必须与设备当前分区布局一致。
+
+            这个 Release 被刻意标成 prerelease，以免顶掉 `releases/latest`（overlay 安装包走那条路）。
           files: |
             dist-firmware/*.bin
             dist-firmware/*.sha256

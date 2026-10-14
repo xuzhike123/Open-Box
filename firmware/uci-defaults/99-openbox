@@ -1,0 +1,46 @@
+#!/bin/sh
+# Open-Box 烘焙进固件:首次启动时执行一次。
+# OpenWrt 约定:本脚本成功退出(0)后,/etc/uci-defaults/ 下的它会被自动删除,
+# 所以它只在"刷完机第一次起来"时跑一次。
+#
+# 这版是烘焙安装:程序本体在只读的 squashfs 里,一个字节都不占 overlay。
+# 只有这些会落到 overlay(上面那层可写的 UBIFS):
+#   - /opt/open-box/data/            订阅、规则集 .srs、流量统计
+#   - /opt/open-box/etc/config.json  面板下发出来的运行配置
+# 所以这里不复制任何程序文件,只做启动所需的最小准备。
+
+[ -d /opt/open-box ] || exit 0
+
+# 面板与内核都要写 data/;面板还会写 etc/config.json。
+# 这两个目录可能就是 squashfs 里那个只读的 /opt/open-box 本身,直接 mkdir -p
+# 会在 overlay 上创建对应的目录项,不需要预先存在。
+mkdir -p /opt/open-box/data
+
+# ImageBuilder 的 FILES= 走的是 cp -fpR,权限位一般能保住;但不同版本、以及
+# 从 tar 解出来的路径上未必,这里按"文件存在就修"的方式补一刀,幂等且不挑上面是谁。
+for f in /opt/open-box/node/bin/node /opt/open-box/bin/sing-box \
+         /opt/open-box/uninstall.sh /opt/open-box/update.sh; do
+	[ -f "$f" ] && chmod 0755 "$f"
+done
+for f in /etc/init.d/openbox /etc/init.d/openbox-panel; do
+	[ -f "$f" ] && chmod 0755 "$f"
+done
+
+# 只开面板的开机自启,不碰内核服务——用户还没配任何东西,内核起来也没意义。
+# 与 scripts/install.sh 的行为保持一致。
+if [ -x /etc/init.d/openbox-panel ]; then
+	/etc/init.d/openbox-panel enable 2>/dev/null || true
+fi
+if [ -x /etc/init.d/openbox ]; then
+	/etc/init.d/openbox disable 2>/dev/null || true
+fi
+
+# 清 LuCI 缓存,否则新菜单/视图不会立刻出现——install.sh 里踩过的同一个坑。
+rm -rf /tmp/luci-*cache* 2>/dev/null || true
+if [ -x /etc/init.d/rpcd ]; then
+	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+fi
+
+echo "[open-box] 已随固件烘焙完成:面板已设开机自启,浏览器打开 http://<路由器IP>:2026"
+
+exit 0

@@ -21,14 +21,36 @@
 
 set -eu
 
-REPO="liandu2024/Open-Box"
+# 本 fork 自己发精简包,所以默认就从本 fork 的 releases 取资产——原来指向上游
+# liandu2024/Open-Box 会装成上游的完整包(解包 ~167MB,小 flash 机型装不下),
+# 而且上游该仓库已闭源。用 OPENBOX_REPO=<owner>/<repo> 可以指向别处的发布。
+REPO="${OPENBOX_REPO:-xuzhike123/Open-Box}"
 INSTALL_ROOT="/opt/open-box"
-MIN_FREE_KB=$((512 * 1024))
+
+# ---- 空间/内存门槛 ----
+# 官方口径是"可用存储 ≥512MB",那是给 x86 软路由写的。精简包解开约 65~70MB
+# (见 scripts/build-release.sh 的"精简打包(SLIM)"一节),所以硬门槛降到 64MB。
+# 硬门槛只负责挡住"明显装不下"的情况,不再充当推荐值:低于 WARN_FREE_MB 时给出
+# 明确警告——因为 /opt/open-box/data 会一直长(规则集 .srs、订阅、流量统计),
+# 装得下不等于用得下去。
+# 需要更紧或更松可以用 OPENBOX_MIN_FREE_MB / OPENBOX_WARN_FREE_MB 覆盖。
+MIN_FREE_MB="${OPENBOX_MIN_FREE_MB:-64}"
+WARN_FREE_MB="${OPENBOX_WARN_FREE_MB:-110}"
+case "$MIN_FREE_MB" in
+  ''|*[!0-9]*)
+    # 这里还不能用 die():基础输出函数定义在下面几行。
+    echo "[open-box] 错误:OPENBOX_MIN_FREE_MB 必须是整数(MB),当前是 '$MIN_FREE_MB'" >&2
+    exit 1
+    ;;
+esac
+MIN_FREE_KB=$((MIN_FREE_MB * 1024))
+WARN_FREE_KB=$((WARN_FREE_MB * 1024))
+
 # 450000KB(≈440MB)而不是标称的 512*1024:512MB 设备的 /proc/meminfo MemTotal 实测
 # 只有约 480-500MB(内核保留了一部分),用 524288 卡阈值会把 README 宣称支持的
 # 最低配机器自己拒之门外。README 的"≥512MB 内存"说的是标称容量,不是这里的检测
-# 阈值,两者故意不一致(P6 终审 Important 2)。
-MIN_MEM_KB=450000
+# 阈值,两者故意不一致(P6 终审 Important 2)。红米 AX6 正是这一类:标称 512MB。
+MIN_MEM_KB="${OPENBOX_MIN_MEM_KB:-450000}"
 
 CHANNEL="direct"
 MIRROR_PREFIX=""
@@ -50,6 +72,14 @@ usage() {
   --mirror <前缀>   使用镜像加速下载发布包,指定具体前缀,例如:
                      --mirror ghproxy.example.com
   -h, --help        显示本帮助
+
+可用环境变量(本 fork 的精简包相关):
+  OPENBOX_REPO=<owner>/<repo>   从哪个仓库取发布资产(默认 xuzhike123/Open-Box)
+  OPENBOX_MIN_FREE_MB=<MB>      可用空间硬门槛,默认 64
+  OPENBOX_WARN_FREE_MB=<MB>     低于此值只警告不阻断,默认 110
+  OPENBOX_MIN_MEM_KB=<KB>       可用内存硬门槛,默认 450000(≈440MB)
+
+  例:OPENBOX_MIN_FREE_MB=48 sh install.sh --mirror
 EOF
 }
 
@@ -130,7 +160,11 @@ check_storage() {
     ''|*[!0-9]*) die "无法检测可用存储空间(df 命令输出异常)。" ;;
   esac
   if [ "$kb" -lt "$MIN_FREE_KB" ]; then
-    die "可用存储不足:检测到约 $((kb / 1024))MB,Open-Box 至少需要 512MB 可用空间。请清理存储后重试。"
+    die "可用存储不足:检测到约 $((kb / 1024))MB,至少需要 ${MIN_FREE_MB}MB。请先卸载/停用其它代理插件(OpenClash、Nikki、PassWall 等)或清理 /overlay 再试;确有必要可用 OPENBOX_MIN_FREE_MB=<MB> 覆盖本门槛,但空间真的不够时解包失败会留下更难收拾的中间状态。"
+  fi
+  # 只警告不阻断:硬门槛负责挡"明显装不下",而"装得下但很快就会满"是另一回事。
+  if [ "$kb" -lt "$WARN_FREE_KB" ]; then
+    warn "可用存储约 $((kb / 1024))MB(建议 ${WARN_FREE_MB}MB 以上)。精简包本身只占约 70MB,但 /opt/open-box/data 会持续增长——规则集 .srs 按需下载、订阅和流量统计都写在这里;空间见底后面板会开始报错。装完请确认还有余量。"
   fi
 }
 
@@ -374,6 +408,23 @@ fi
 # 发布产物在 CI runner 上打包,tar 里的属主 uid/gid 是 runner 的,不是这台路由器的
 # root(0);统一改回 0:0,避免残留一个陌生 uid(P6 终审 Minor)。
 chown -R 0:0 "$INSTALL_ROOT" || warn "重置 $INSTALL_ROOT 属主为 root 失败,可能不影响使用。"
+
+# ---------- node 运行时自检 ----------
+# 精简包里的 node 经过"裁剪非加载节 + UPX 压缩"(见 scripts/build-release.sh 的
+# 精简打包一节),万一在这台机器的内核/musl 上跑不起来,宁可在安装的最后一步明确
+# 报出来,也不要让用户对着一个被 procd 反复重启的面板服务猜原因。
+# 这里刻意复刻 openwrt/initd/openbox-panel 启动 node 时的环境(LD_LIBRARY_PATH 指向
+# 随包捆绑的 node/lib),所以它同时也在验证那一步的依赖是否齐全。
+NODE_BIN="$INSTALL_ROOT/node/bin/node"
+if [ ! -x "$NODE_BIN" ]; then
+  warn "找不到 $NODE_BIN,面板无法启动。安装包可能不完整。"
+elif ! LD_LIBRARY_PATH="$INSTALL_ROOT/node/lib" "$NODE_BIN" -e 'process.exit(0)' >/dev/null 2>&1; then
+  warn "node 运行时自检失败,面板很可能起不来(内核已装、可独立使用)。"
+  warn "请把下面这条命令的完整输出发给维护者:"
+  warn "  LD_LIBRARY_PATH=$INSTALL_ROOT/node/lib $NODE_BIN -e 'process.exit(0)'"
+else
+  info "node 运行时自检通过。"
+fi
 
 # 校验、解包都已完成,此时读取的版本号就是实际装上的版本号(见上面 Important 5 的
 # 说明:不再从 GitHub API 的 tag_name 提前拿版本号)。

@@ -1,0 +1,168 @@
+name: Firmware (bake Open-Box into ImmortalWrt)
+
+# 把精简版 Open-Box 直接烘焙进 ImmortalWrt 固件镜像,产出一个 sysupgrade 镜像。
+#
+# 这条路和 Release 那个工作流的区别:
+#   Release  → 产出 open-box-linux-arm64.tar.gz,装到路由器的 /overlay 上(占 63MB 可写空间)
+#   Firmware → 产出整份固件镜像,Open-Box 在只读 squashfs 里(占约 33MB 固件空间,
+#              overlay 一个字节不占,而且不需要 UPX)
+#
+# 触发方式刻意只留手动 + fw-v* 标签:刷固件是有风险的动作,不该因为推一个普通
+# commit 就被自动跑出来一个看起来能刷的东西。
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'ImmortalWrt profile(必须与设备当前分区布局一致)'
+        required: true
+        default: 'redmi_ax6'
+        type: choice
+        options:
+          - redmi_ax6          # 红米 AX6:OpenWrt expand layout(社区所说的"扩容布局")
+          - redmi_ax6-stock    # 红米 AX6:stock layout / 自定义 U-Boot 布局
+      version:
+        description: '写进面板 meta.json 的版本号(留空则用当前 ref 名)'
+        required: false
+        default: ''
+      extra_packages:
+        description: '额外追加到镜像里的 opkg 包(空格分隔,可留空)'
+        required: false
+        default: ''
+      attach_to_tag:
+        description: '把镜像附到这个已存在的 tag 的 Release 上(留空则只上传 artifact)'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'fw-v*'
+      # fw-stock-v... 打 redmi_ax6-stock(stock / 自定义 U-Boot 布局)。
+      # 必须留这条:workflow_dispatch 要求 workflow 文件已经在默认分支上,而这个分支
+      # 还没合并时下拉框是用不了的;靠标签前缀选择变体就不受这个限制。
+      - 'fw-stock-v*'
+
+env:
+  # 烘焙模式下不需要 UPX:squashfs(xz)压得更好,而且不带 UPX 那笔运行时内存开销。
+  OPENBOX_SLIM: '1'
+  OPENBOX_UPX: '0'
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    name: Build firmware
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # profile 怎么定:
+      #   手动触发  -> 用下拉框选的值
+      #   标签触发  -> 看前缀:fw-stock-v... 走 stock 变体,其余走 expand 变体
+      # 两种变体是互不兼容的分区方案,所以名字要一眼能看出打的是哪个。
+      - name: Resolve profile
+        id: profile
+        run: |
+          if [ -n "${{ github.event.inputs.profile }}" ]; then
+            echo "name=${{ github.event.inputs.profile }}" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_NAME#fw-stock-}" != "${GITHUB_REF_NAME}" ]; then
+            echo "name=redmi_ax6-stock" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=redmi_ax6" >> "$GITHUB_OUTPUT"
+          fi
+          echo "使用 profile: $(cat "$GITHUB_OUTPUT" | tail -n1)"
+
+      # build-firmware.sh 内部会调用 build-release.sh 打"不开 UPX 的精简载荷",
+      # 所以这里需要和 Release 工作流完全一样的构建期依赖:Node+pnpm 编前端、
+      # Go 编 sing-box。(不需要 upx,因为 OPENBOX_UPX=0。)
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install panel dependencies
+        working-directory: panel
+        run: corepack pnpm install --frozen-lockfile
+
+      # ImageBuilder 需要的宿主工具。ubuntu-24.04 runner 上大部分已有,这里补齐
+      # 容易缺的那几个:
+      #   zstd            解 ImageBuilder 的 .tar.zst
+      #   squashfs-tools  提供 unsquashfs,build-firmware.sh 用它核对"打进镜像的
+      #                   root.squashfs 里到底有没有 /opt/open-box 那些文件"
+      - name: Install ImageBuilder host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd squashfs-tools build-essential libncurses-dev \
+            zlib1g-dev gawk gettext libssl-dev xsltproc rsync unzip wget file
+
+      - name: Build firmware image
+        env:
+          OPENBOX_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+          OPENBOX_FIRMWARE_PACKAGES: ${{ github.event.inputs.extra_packages }}
+        run: |
+          PROFILE="${{ steps.profile.outputs.name }}"
+          # tag 走的是 fw-v1.2.3 这种名字,但面板里显示的版本号不该带这个前缀
+          VERSION="${OPENBOX_VERSION#fw-}"
+          echo "profile=$PROFILE version=$VERSION"
+          OPENBOX_VERSION="$VERSION" sh scripts/build-firmware.sh dist-firmware "$PROFILE"
+
+      - name: Show result
+        run: ls -lh dist-firmware
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-box-firmware-${{ steps.profile.outputs.name }}
+          path: |
+            dist-firmware/*.bin
+            dist-firmware/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # 解析"要不要顺带把镜像附到某个 Release 上":
+      #   手动触发 → 用 attach_to_tag 输入;
+      #   fw-v* 标签触发 → 就用这个标签本身。
+      # 这样推一个标签就能拿到可以直接下载的 Release 资产,不必再进 Actions 页面
+      # 从 artifact 里翻(artifact 还有 30 天过期问题)。
+      - name: Resolve release tag
+        id: release_tag
+        run: |
+          if [ -n "${{ github.event.inputs.attach_to_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.attach_to_tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach firmware to release
+        if: ${{ steps.release_tag.outputs.tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: Open-Box firmware ${{ steps.release_tag.outputs.tag }}
+          # 必须标成 prerelease。原因:GitHub 的 releases/latest 会跳过 prerelease,
+          # 而 scripts/install.sh 正是靠 releases/latest/download/open-box-linux-arm64.tar.gz
+          # 拿 overlay 安装包的。固件 Release 如果不标,就会顶掉 latest,让"一键安装"
+          # 直接 404——等于用一个能刷机的产物把另一条安装路径弄坏了。
+          prerelease: true
+          body: |
+            烘焙进 ImmortalWrt 固件的 Open-Box（profile `${{ steps.profile.outputs.name }}`）。
+
+            Open-Box 程序本体在只读 squashfs 里，xz 压缩，不占 overlay，且不使用 UPX。
+            刷机方式与普通 ImmortalWrt 固件相同；注意 profile 必须与设备当前分区布局一致。
+
+            这个 Release 被刻意标成 prerelease，以免顶掉 `releases/latest`（overlay 安装包走那条路）。
+          files: |
+            dist-firmware/*.bin
+            dist-firmware/*.sha256

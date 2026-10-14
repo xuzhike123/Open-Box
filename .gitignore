@@ -9,3 +9,7 @@ panel/data/
 .dev-panel.log
 panel/.tools/sing-box
 .build-cache/
+# build-release.sh / build-firmware.sh 的默认产物目录:几十 MB 的 tarball 与
+# 几十 MB 的固件镜像,不该被顺手 git add 进来。
+dist-release/
+dist-firmware/

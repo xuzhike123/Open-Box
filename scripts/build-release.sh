@@ -11,15 +11,21 @@
 # github.com/<repo>/releases/latest/download/<asset> 直链拿最新版,不查询
 # api.github.com——见 Important 5;两者内容字节级相同,只是文件名不同)。
 # tarball 解开后即 /opt/open-box 的内容:
-#   node/            musl Node 运行时(bin/node、lib/ 里是捆绑的 musl 版
-#                    libstdc++.so.6 / libgcc_s.so.1,见下方 Critical 1)
-#   panel/dist/      前端构建产物
+#   node/            musl Node 运行时(bin/node;lib/ 里是否捆绑 musl 版
+#                    libstdc++.so.6 / libgcc_s.so.1 由 node 自己的 DT_NEEDED 决定,
+#                    见下方 Critical 1)。SLIM=1 时 bin/node 是 UPX 压缩过的,
+#                    体积约为原来的三成,代价见下文"精简打包(SLIM)"一节
+#   panel/dist/      前端构建产物(SLIM=1 时为 no-fonts 构建,不含子集化字体)
 #   panel/server/    corepack pnpm deploy --prod 产出的自包含后端
-#   bin/sing-box     钦定版本 sing-box 二进制
+#   bin/sing-box     钦定版本 sing-box 二进制(SLIM=1 时按精简 tag 从源码现场编译)
 #   openwrt/         initd/ 与 luci/(供安装脚本铺到系统路径)
 #   uninstall.sh     卸载脚本(供 LuCI 兜底页与离线卸载调用)
 #   update.sh        升级脚本(供 LuCI 兜底页一键升级调用;支持 --detach 后台执行)
-#   meta.json        {version, singboxVersion, nodeVersion, arch, builtAt}
+#   meta.json        {version, singboxVersion, nodeVersion, arch, slim, nodeCompression,
+#                     singboxBuild, singboxTags, builtAt}
+#
+# 关于体积:面向小 flash 路由器的"精简打包(SLIM)"默认开启,配置项与实测数据见下方
+# 同名注释块。不想精简就 OPENBOX_SLIM=0。
 #
 # 关键事实,不要"简化"掉:OpenWrt 用 musl libc,官方 nodejs.org 的 linux-x64/arm64
 # 二进制是 glibc 链接的,在路由器上起不来。必须用 unofficial-builds 的 musl 构建。
@@ -82,6 +88,62 @@ ALPINE_LIBSTDCPP_SHA256_AARCH64="2302e766d4e4926038ec166ecb85837ee884576115236dd
 ALPINE_LIBGCC_SHA256_X86_64="393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637"
 ALPINE_LIBGCC_SHA256_AARCH64="369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403"
 
+# ---- 精简打包(SLIM):面向小 flash 设备 ----
+# 默认开启。目标机型是 128MB NAND 的路由器(如红米 AX6:IPQ8071A / aarch64 /
+# 512MB RAM,刷 ImmortalWrt 并扩容 overlay)。README 里"可用存储 ≥512MB"的门槛
+# 这类机器根本达不到,按原样打出来的包也就装不进去。SLIM 做四件事,每一件都实测过:
+#
+#   1. 前端用 `pnpm run build:no-fonts`(--mode SystemUI)构建。默认构建会把
+#      Fira Sans / MiSans / SarasaUiSC / PingFangSC 四套子集化字体全打进 dist,
+#      实测 dist 9.99MB → 3.53MB(省 6.46MB)。代价是界面回落到浏览器系统字体,
+#      桌面浏览器上中文显示照常。
+#
+#   2. sing-box 由源码按精简 build tag 现场编译,而不是下载 SagerNet 的全功能
+#      发布资产(arm64 40.83MB)。tag 集合取自 OpenWrt packages feed 的
+#      sing-box-tiny 变体,并补上 Open-Box 面板真正用到的协议。实测 arm64 静态二进制:
+#        core only                     22.56MB
+#        +gvisor                       26.31MB   tun(stack: mixed)
+#        +clash_api                    26.69MB   面板流量/连接/穿透查询要靠它
+#        +utls                         26.88MB   vless REALITY
+#        +quic                         29.63MB   hysteria2 / tuic
+#        +wireguard                    30.19MB   wireguard 端点
+#        +grpc                         33.25MB   vmess/vless 的 grpc 传输
+#      默认带 grpc:机场订阅里 grpc 节点很常见,缺这个 tag sing-box 会在 check
+#      阶段直接 FATAL,整个内核起不来。想再省 3MB 就从 OPENBOX_SINGBOX_TAGS 里去掉。
+#
+#   3. arm64 不再无条件铺 node/lib 里的 musl libstdc++ / libgcc(2.82MB → 0.13MB)。
+#      上游注释自己写过 arm64 的 Node 不需要 libstdc++——实测确实如此:arm64 的 musl
+#      Node 24.18.0 的 DT_NEEDED 只有 libgcc_s.so.1 与 libc.so 两条。SLIM 下改为
+#      "只铺 DT_NEEDED 真正点名要的库,而且只要点名了才去下对应的 Alpine 包",
+#      由下面第 5 步的构建期守卫兜底——真缺了会当场构建失败,不会装到路由器上才发现
+#      面板起不来。
+#
+#   4. 裁剪并压缩 node/bin/node。这是省得最多的一条:Node 运行时占了整包一半以上。
+#      分两步,顺序不能反(见下面第 5b 步;数字是 arm64 Node 24.18.0 的实测值):
+#        原始                            121.83MB
+#        裁掉非 PT_LOAD 的节表/调试段     93.76MB   (scripts/elf-strip.py)
+#        UPX --lzma 压缩后                23.85MB
+#      代价必须说清楚:UPX 是 exec 时把整个二进制解压到匿名内存里跑的,面板进程
+#      常驻内存会多出约一个 node 二进制的量(几十 MB)。AX6 有 512MB 内存,余量够;
+#      内存只有 256MB 的机型请设 OPENBOX_UPX=0(裁剪省的 28MB 仍然拿得到),
+#      OPENBOX_STRIP=0 可以把裁剪也一起关掉,只保留另外三条。
+#
+# 四条合计:arm64 解包后从约 179MB 降到约 70MB。
+# 完全关掉精简行为:OPENBOX_SLIM=0 sh scripts/build-release.sh arm64 dist-release
+SLIM="${OPENBOX_SLIM:-1}"
+
+# sing-box 精简构建的 tag 集合(见上面第 2 条)。
+SINGBOX_TAGS="${OPENBOX_SINGBOX_TAGS:-with_gvisor,with_quic,with_utls,with_clash_api,with_wireguard,with_grpc,badlinkname,tfogo_checklinkname0}"
+# Go 交叉编译的目标架构名(sing-box 用 Go 的命名,与 $SINGBOX_ARCH 恰好一致)。
+SINGBOX_GOARCH=""
+# 裁剪 node 二进制里不加载的节表/调试段(见上面第 4 条,仅 SLIM=1 时生效)。
+STRIP="${OPENBOX_STRIP:-1}"
+# UPX 压缩 node 二进制(见上面第 4 条,仅 SLIM=1 时生效)。
+UPX="${OPENBOX_UPX:-1}"
+# --lzma 比默认的 NRV 压得更狠(同一个未裁剪二进制上实测 30.18MB vs 38.48MB),
+# 启动时多花一点解压时间,对小 flash 更划算。
+UPX_ARGS="${OPENBOX_UPX_ARGS:---lzma -9}"
+
 usage() {
   echo "usage: $0 <x64|arm64> <outdir>" >&2
   exit 1
@@ -94,6 +156,7 @@ OUTDIR_ARG="$2"
 case "$ARCH" in
   x64)
     SINGBOX_ARCH="amd64"
+    SINGBOX_GOARCH="amd64"
     ALPINE_ARCH="x86_64"
     NODE_SHA256="$NODE_SHA256_X64"
     SINGBOX_SHA256="$SINGBOX_SHA256_AMD64"
@@ -102,6 +165,7 @@ case "$ARCH" in
     ;;
   arm64)
     SINGBOX_ARCH="arm64"
+    SINGBOX_GOARCH="arm64"
     ALPINE_ARCH="aarch64"
     NODE_SHA256="$NODE_SHA256_ARM64"
     SINGBOX_SHA256="$SINGBOX_SHA256_ARM64"
@@ -118,6 +182,28 @@ command -v python3 >/dev/null 2>&1 || {
   echo "ERROR: 需要 python3 来解析构建产物的 DT_NEEDED(见 dt-needed.py,构建期依赖守卫)" >&2
   exit 1
 }
+
+# SLIM 下 sing-box 是现场编译的,先确认构建机有够新的 Go——sing-box 的 go.mod
+# 声明了 go 1.24.7。宁可在这里明确报错,也不要让 go build 半路抛一段难读的报错。
+if [ "$SLIM" = "1" ]; then
+  command -v go >/dev/null 2>&1 || {
+    echo "ERROR: OPENBOX_SLIM=1 需要 Go 工具链来精简编译 sing-box(用 OPENBOX_SLIM=0 可退回官方发布资产)" >&2
+    exit 1
+  }
+  GO_VERSION=$(go env GOVERSION 2>/dev/null | sed -n 's/^go//p')
+  if ! awk -v v="$GO_VERSION" 'BEGIN { split(v, a, "."); if (a[1] > 1 || (a[1] == 1 && a[2] > 24) || (a[1] == 1 && a[2] == 24 && a[3] >= 7)) exit 0; exit 1 }'; then
+    echo "ERROR: sing-box $SINGBOX_VERSION 要求 Go >= 1.24.7,当前构建机是 go${GO_VERSION:-未知}" >&2
+    exit 1
+  fi
+fi
+
+if [ "$SLIM" = "1" ] && [ "$UPX" = "1" ]; then
+  command -v upx >/dev/null 2>&1 || {
+    echo "ERROR: OPENBOX_UPX=1 需要 upx(apt-get install -y upx-ucl,或从 upx/upx releases 取官方二进制);" >&2
+    echo "       不想装就设 OPENBOX_UPX=0——包会大到约 130MB,小 flash 机型装不下。" >&2
+    exit 1
+  }
+fi
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -137,6 +223,26 @@ sha256_of() {
   else
     shasum -a 256 "$1" | awk '{print $1}'
   fi
+}
+
+# SLIM 用:删掉自包含后端里对运行毫无用处、却要跟着进 flash 的东西。
+# 只删证据确凿的几类,不做"猜着瘦身":
+#   - *.test.mjs 等测试文件,以及 node_modules 里的 test/tests/__tests__ 目录
+#     (npm 生态里包内 test/ 就是上游测试,没有运行时会被 require)
+#   - *.md / CHANGELOG*:LICENSE 一律保留——删许可证不是省空间,是找麻烦
+#   - *.map:sourcemap 只在浏览器 devtools 里用得上
+#   - pnpm 的 lockfile:部署产物不需要它
+# node_modules/.bin 保留:里面是 pnpm 的符号链接,删了将来改用 npm script 启服务
+# 会踩空,而它本身几乎不占空间。
+prune_server_payload() {
+  root="$1"
+  [ -d "$root" ] || return 0
+  find "$root" -type f \( -name '*.test.mjs' -o -name '*.test.js' -o -name '*.spec.js' \) -delete 2>/dev/null || true
+  if [ -d "$root/node_modules" ]; then
+    find "$root/node_modules" -type d \( -name test -o -name tests -o -name __tests__ -o -name __mocks__ \) -exec rm -rf {} + 2>/dev/null || true
+  fi
+  find "$root" -type f \( -name '*.md' -o -name '*.markdown' -o -name 'CHANGELOG*' -o -name '*.map' \) -delete 2>/dev/null || true
+  rm -f "$root/pnpm-lock.yaml" 2>/dev/null || true
 }
 
 # 下载前先用 Range 请求探活(比 HEAD 更可靠:GitHub/S3 的预签名下载链接常常只对
@@ -199,13 +305,24 @@ trap 'rm -rf "$STAGE"' EXIT INT TERM
 mkdir -p "$STAGE/node/lib" "$STAGE/panel" "$STAGE/bin" "$STAGE/openwrt"
 
 # ---- 1. 构建前端 ----
-log "构建面板前端 (vite build)..."
-(cd "$PANEL_DIR" && corepack pnpm run build)
+# SLIM 走 build:no-fonts(--mode SystemUI,见文件头第 1 条):四套子集化字体不进 dist。
+if [ "$SLIM" = "1" ]; then
+  log "构建面板前端 (vite build,no-fonts 精简模式)..."
+  (cd "$PANEL_DIR" && corepack pnpm run build:no-fonts)
+else
+  log "构建面板前端 (vite build)..."
+  (cd "$PANEL_DIR" && corepack pnpm run build)
+fi
 cp -R "$PANEL_DIR/dist" "$STAGE/panel/dist"
 
 # ---- 2. pnpm deploy 出自包含 server ----
 log "打包面板后端 (pnpm deploy --prod)..."
 (cd "$PANEL_DIR" && corepack pnpm --filter=./server deploy --prod "$STAGE/panel/server")
+
+if [ "$SLIM" = "1" ]; then
+  log "裁剪后端产物(测试、文档、sourcemap、lockfile)..."
+  prune_server_payload "$STAGE/panel/server"
+fi
 
 # ---- 3. 下载并解出 musl Node ----
 NODE_TARBALL="node-v${NODE_VERSION}-linux-${ARCH}-musl.tar.xz"
@@ -231,45 +348,95 @@ chmod +x "$STAGE/node/bin/node"
 cp "$NODE_INNER_DIR/LICENSE" "$STAGE/node/LICENSE"
 rm -rf "$NODE_EXTRACT_DIR"
 
+# ---- 3b. 解析 node 真实的 DT_NEEDED,据此决定要铺哪几个 musl 动态库 ----
+# 先解析、再决定要不要去下载 Alpine 的包。实测 arm64 的 musl Node 24.18.0 只点名
+# libgcc_s.so.1 与 libc.so,libstdc++ 一个字节都不需要——那种情况下根本没必要去
+# dl-cdn.alpinelinux.org 拉两个 apk 再解一遍。非 SLIM 走老路径(两个都铺),所以
+# 这里仍然把 NEED_* 按"要铺"算。
+log "解析 node 的 DT_NEEDED..."
+NODE_NEEDED=$(python3 "$SCRIPT_DIR/dt-needed.py" "$STAGE/node/bin/node") || {
+  echo "ERROR: 无法解析 $STAGE/node/bin/node 的 DT_NEEDED" >&2
+  exit 1
+}
+# 去掉行尾可能带的 CR:Python 在 Windows 上写 stdout 是文本模式,会把每个 \n 变成
+# \r\n,于是每一行都拖着个 \r,下面按行比对的 case 就会把 libgcc_s.so.1 判成"不在
+# 允许集里",报出来的却是"依赖未捆绑进 node/lib/"——方向完全错了。Linux CI 上不会
+# 触发,但本地用 Git bash 复现构建时会,而且排查成本远高于这一行。
+NODE_NEEDED=$(printf '%s\n' "$NODE_NEEDED" | tr -d '\r')
+NEED_STDCPP=0
+NEED_LIBGCC=0
+OLD_IFS=$IFS
+IFS='
+'
+set -f
+for lib in $NODE_NEEDED; do
+  case "$lib" in
+    libstdc++.so.*) NEED_STDCPP=1 ;;
+    libgcc_s.so.*) NEED_LIBGCC=1 ;;
+  esac
+done
+set +f
+IFS="$OLD_IFS"
+if [ "$SLIM" != "1" ]; then
+  # 非 SLIM:保持老行为,两个架构都统一带上,不赌上游的链接方式。
+  NEED_STDCPP=1
+  NEED_LIBGCC=1
+fi
+log "DT_NEEDED 对 musl 库的需求:libstdc++=$NEED_STDCPP libgcc_s=$NEED_LIBGCC"
+
 # ---- 4. 下载并解出 Alpine 的 musl 版 libstdc++ / libgcc(Critical 1)----
 # apk 包本质是 gzip 的 tar,直接 tar -xzf 就能取出 usr/lib/ 下的 .so;不解 .PKGINFO
-# 也不装 apk 工具本身。两个架构都拿,即使 arm64 当前用不上也保持产物结构一致。
-ALPINE_LIBSTDCPP_PKG="libstdc++-${ALPINE_GCC_PKG_VERSION}.apk"
-ALPINE_LIBGCC_PKG="libgcc-${ALPINE_GCC_PKG_VERSION}.apk"
-ALPINE_BASE_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/${ALPINE_ARCH}"
-ALPINE_LIBSTDCPP_CACHE="$CACHE_DIR/alpine-${ALPINE_ARCH}-${ALPINE_LIBSTDCPP_PKG}"
-ALPINE_LIBGCC_CACHE="$CACHE_DIR/alpine-${ALPINE_ARCH}-${ALPINE_LIBGCC_PKG}"
-fetch_cached "$ALPINE_BASE_URL/$ALPINE_LIBSTDCPP_PKG" "$ALPINE_LIBSTDCPP_CACHE" \
-  "Alpine musl libstdc++ $ALPINE_GCC_PKG_VERSION ($ALPINE_ARCH)" "$ALPINE_LIBSTDCPP_SHA256"
-fetch_cached "$ALPINE_BASE_URL/$ALPINE_LIBGCC_PKG" "$ALPINE_LIBGCC_CACHE" \
-  "Alpine musl libgcc $ALPINE_GCC_PKG_VERSION ($ALPINE_ARCH)" "$ALPINE_LIBGCC_SHA256"
+# 也不装 apk 工具本身。只有真的要点名铺库里至少一个时才做这一步(见上一步)。
+if [ "$NEED_STDCPP" = "1" ] || [ "$NEED_LIBGCC" = "1" ]; then
+  ALPINE_BASE_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/${ALPINE_ARCH}"
+  ALPINE_EXTRACT_DIR="$STAGE/.alpine-extract"
+  mkdir -p "$ALPINE_EXTRACT_DIR"
 
-log "解出 Alpine musl libstdc++ / libgcc..."
-ALPINE_EXTRACT_DIR="$STAGE/.alpine-extract"
-mkdir -p "$ALPINE_EXTRACT_DIR"
-tar -xzf "$ALPINE_LIBSTDCPP_CACHE" -C "$ALPINE_EXTRACT_DIR" usr/lib/
-tar -xzf "$ALPINE_LIBGCC_CACHE" -C "$ALPINE_EXTRACT_DIR" usr/lib/
-if [ ! -e "$ALPINE_EXTRACT_DIR/usr/lib/libstdc++.so.6" ] || [ ! -e "$ALPINE_EXTRACT_DIR/usr/lib/libgcc_s.so.1" ]; then
-  echo "ERROR: Alpine apk 包内部布局与预期不符,找不到 libstdc++.so.6 / libgcc_s.so.1" >&2
-  exit 1
+  # 只取真正要铺的那一个包:arm64 上往往只需要 libgcc,那就没必要把 2.7MB 的
+  # libstdc++ 包也拉一遍、解一遍。
+  if [ "$NEED_STDCPP" = "1" ]; then
+    ALPINE_LIBSTDCPP_PKG="libstdc++-${ALPINE_GCC_PKG_VERSION}.apk"
+    ALPINE_LIBSTDCPP_CACHE="$CACHE_DIR/alpine-${ALPINE_ARCH}-${ALPINE_LIBSTDCPP_PKG}"
+    fetch_cached "$ALPINE_BASE_URL/$ALPINE_LIBSTDCPP_PKG" "$ALPINE_LIBSTDCPP_CACHE" \
+      "Alpine musl libstdc++ $ALPINE_GCC_PKG_VERSION ($ALPINE_ARCH)" "$ALPINE_LIBSTDCPP_SHA256"
+    log "解出 Alpine musl libstdc++..."
+    tar -xzf "$ALPINE_LIBSTDCPP_CACHE" -C "$ALPINE_EXTRACT_DIR" usr/lib/
+    if [ ! -e "$ALPINE_EXTRACT_DIR/usr/lib/libstdc++.so.6" ]; then
+      echo "ERROR: Alpine apk 包内部布局与预期不符,找不到 libstdc++.so.6" >&2
+      exit 1
+    fi
+    # -P 保留符号链接本身(libstdc++.so.6 -> libstdc++.so.6.0.x),不展开成两份拷贝。
+    cp -P "$ALPINE_EXTRACT_DIR"/usr/lib/libstdc++.so.6* "$STAGE/node/lib/"
+  fi
+
+  if [ "$NEED_LIBGCC" = "1" ]; then
+    ALPINE_LIBGCC_PKG="libgcc-${ALPINE_GCC_PKG_VERSION}.apk"
+    ALPINE_LIBGCC_CACHE="$CACHE_DIR/alpine-${ALPINE_ARCH}-${ALPINE_LIBGCC_PKG}"
+    fetch_cached "$ALPINE_BASE_URL/$ALPINE_LIBGCC_PKG" "$ALPINE_LIBGCC_CACHE" \
+      "Alpine musl libgcc $ALPINE_GCC_PKG_VERSION ($ALPINE_ARCH)" "$ALPINE_LIBGCC_SHA256"
+    log "解出 Alpine musl libgcc..."
+    tar -xzf "$ALPINE_LIBGCC_CACHE" -C "$ALPINE_EXTRACT_DIR" usr/lib/
+    if [ ! -e "$ALPINE_EXTRACT_DIR/usr/lib/libgcc_s.so.1" ]; then
+      echo "ERROR: Alpine apk 包内部布局与预期不符,找不到 libgcc_s.so.1" >&2
+      exit 1
+    fi
+    cp -P "$ALPINE_EXTRACT_DIR"/usr/lib/libgcc_s.so.1* "$STAGE/node/lib/"
+  fi
+
+  rm -rf "$ALPINE_EXTRACT_DIR"
+else
+  log "node 不需要捆绑任何 musl 动态库,跳过 Alpine 包的下载与铺装。"
 fi
-# -P 保留符号链接本身(libstdc++.so.6 -> libstdc++.so.6.0.x),不展开成两份拷贝。
-cp -P "$ALPINE_EXTRACT_DIR"/usr/lib/libstdc++.so.6* "$STAGE/node/lib/"
-cp -P "$ALPINE_EXTRACT_DIR"/usr/lib/libgcc_s.so.1* "$STAGE/node/lib/"
-rm -rf "$ALPINE_EXTRACT_DIR"
 
-# ---- 5. 构建期依赖守卫(Critical 1):解析 node 二进制真实的 DT_NEEDED,任何一条
+# ---- 5. 构建期依赖守卫(Critical 1):复核 node 二进制真实的 DT_NEEDED,任何一条
 # 既没被捆绑进 node/lib/、又不属于 OpenWrt 默认可用集的依赖都直接构建失败。允许集:
 #   - node/lib/ 里已捆绑的文件名(见上一步)
 #   - libc.musl-*(Alpine/OpenWrt 风格 soname)与字面量 libc.so(musl 动态链接器把
 #     libc./libpthread./librt./libm./libdl./libutil./libxnet. 开头的 NEEDED 名字
 #     都当保留名直接自解析,不做文件查找——已用 musl 官方源码交叉验证,见文件头注释)
 #   - libgcc_s.so.1(OpenWrt DEFAULT_PACKAGES 自带 libgcc)
-log "校验 node 的 DT_NEEDED(构建期依赖守卫)..."
-NODE_NEEDED=$(python3 "$SCRIPT_DIR/dt-needed.py" "$STAGE/node/bin/node") || {
-  echo "ERROR: 无法解析 $STAGE/node/bin/node 的 DT_NEEDED" >&2
-  exit 1
-}
+log "复核 node 的 DT_NEEDED(构建期依赖守卫)..."
+
 BAD_NEEDED=""
 OLD_IFS=$IFS
 IFS='
@@ -295,24 +462,94 @@ if [ -n "$BAD_NEEDED" ]; then
 fi
 log "DT_NEEDED 校验通过($ARCH): $(printf '%s' "$NODE_NEEDED" | tr '\n' ' ')"
 
-# ---- 6. 下载并解出 sing-box(注意 x64→amd64 映射;必须是 -musl 资产,见上)----
-SINGBOX_TARBALL="sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}-musl.tar.gz"
-SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${SINGBOX_TARBALL}"
-SINGBOX_CACHE="$CACHE_DIR/$SINGBOX_TARBALL"
-fetch_cached "$SINGBOX_URL" "$SINGBOX_CACHE" "sing-box $SINGBOX_VERSION ($SINGBOX_ARCH)" "$SINGBOX_SHA256"
-
-log "解出 sing-box..."
-SINGBOX_EXTRACT_DIR="$STAGE/.singbox-extract"
-mkdir -p "$SINGBOX_EXTRACT_DIR"
-tar -xzf "$SINGBOX_CACHE" -C "$SINGBOX_EXTRACT_DIR"
-SINGBOX_BIN=$(find "$SINGBOX_EXTRACT_DIR" -type f -name sing-box | head -n 1)
-if [ -z "$SINGBOX_BIN" ]; then
-  echo "ERROR: sing-box tarball 里找不到 sing-box 二进制" >&2
-  exit 1
+# ---- 5b. 裁剪 + 压缩 node 二进制(SLIM,见文件头第 4 条)----
+# 两步都必须排在第 5 步之后:守卫解析的是真实 ELF 的程序头,而这两步都会改变文件
+# 形态(先裁掉节表、再整体压缩),顺序反了守卫会直接解析失败。
+#
+# 先裁后压,顺序不能反。实测 arm64 Node 24.18.0(121.83MB)里有 28.27MB 是
+# .symtab / .strtab / .debug_*,它们不在任何 PT_LOAD 段里、运行时一个字节都用不到,
+# 但照样会被 UPX 压进产物。裁掉再压 = 23.85MB,直接压 = 28.78MB,同一个二进制差 4.9MB。
+# (上游自己的发布包里 node 正是 93.76MB,等于裁完的大小,说明他们也是 strip 过的。)
+if [ "$SLIM" = "1" ] && [ "$STRIP" = "1" ]; then
+  NODE_BYTES_BEFORE=$(wc -c < "$STAGE/node/bin/node")
+  python3 "$SCRIPT_DIR/elf-strip.py" "$STAGE/node/bin/node" || {
+    echo "ERROR: 裁剪 node 二进制失败(elf-strip.py)" >&2
+    exit 1
+  }
+  NODE_BYTES_STRIPPED=$(wc -c < "$STAGE/node/bin/node")
+  log "node 二进制裁剪:$((NODE_BYTES_BEFORE / 1024))KB -> $((NODE_BYTES_STRIPPED / 1024))KB"
 fi
-cp "$SINGBOX_BIN" "$STAGE/bin/sing-box"
-chmod +x "$STAGE/bin/sing-box"
-rm -rf "$SINGBOX_EXTRACT_DIR"
+
+if [ "$SLIM" = "1" ] && [ "$UPX" = "1" ]; then
+  NODE_BYTES_BEFORE=$(wc -c < "$STAGE/node/bin/node")
+  log "UPX 压缩 node ($UPX_ARGS)..."
+  upx $UPX_ARGS -q "$STAGE/node/bin/node" || {
+    echo "ERROR: UPX 压缩 node 失败(可用 OPENBOX_UPX=0 跳过,但包会大到约 130MB)" >&2
+    exit 1
+  }
+  # upx -t 是 UPX 自己的完整性校验,不会执行目标二进制,所以交叉架构下也能用。
+  # 校验不过就当场失败,不把可能损坏的二进制打进产物。
+  upx -t -q "$STAGE/node/bin/node" >/dev/null 2>&1 || {
+    echo "ERROR: UPX 压缩后的 node 未通过 upx -t 完整性校验" >&2
+    exit 1
+  }
+  NODE_BYTES_AFTER=$(wc -c < "$STAGE/node/bin/node")
+  log "node 二进制压缩:$((NODE_BYTES_BEFORE / 1024))KB -> $((NODE_BYTES_AFTER / 1024))KB"
+fi
+
+# ---- 6. sing-box ----
+if [ "$SLIM" = "1" ]; then
+  # SLIM:从源码按精简 tag 现场编译(见文件头第 2 条),不下载 40.83MB 的全功能资产。
+  command -v git >/dev/null 2>&1 || {
+    echo "ERROR: OPENBOX_SLIM=1 需要 git 来取 sing-box 源码" >&2
+    exit 1
+  }
+  SB_SRC="$CACHE_DIR/sing-box-src-$SINGBOX_VERSION"
+  if [ -d "$SB_SRC/.git" ]; then
+    log "命中缓存的 sing-box 源码: $SB_SRC"
+  else
+    log "克隆 sing-box v$SINGBOX_VERSION 源码..."
+    rm -rf "$SB_SRC"
+    git clone --depth 1 --branch "v$SINGBOX_VERSION" \
+      https://github.com/SagerNet/sing-box.git "$SB_SRC" || {
+      echo "ERROR: 克隆 sing-box 源码失败" >&2
+      exit 1
+    }
+  fi
+
+  log "精简编译 sing-box (GOARCH=$SINGBOX_GOARCH, tags: $SINGBOX_TAGS)..."
+  (
+    cd "$SB_SRC" &&
+      CGO_ENABLED=0 GOOS=linux GOARCH="$SINGBOX_GOARCH" \
+        go build -tags "$SINGBOX_TAGS" -trimpath \
+          -ldflags "-s -w -checklinkname=0 -X github.com/sagernet/sing-box/constant.Version=$SINGBOX_VERSION" \
+          -o "$STAGE/bin/sing-box" ./cmd/sing-box
+  ) || {
+    echo "ERROR: sing-box 精简编译失败" >&2
+    exit 1
+  }
+  chmod +x "$STAGE/bin/sing-box"
+  log "精简 sing-box 构建完成($(du -h "$STAGE/bin/sing-box" | awk '{print $1}'))"
+else
+  # ---- 原路径:下载并解出 sing-box(注意 x64→amd64 映射;必须是 -musl 资产,见上)----
+  SINGBOX_TARBALL="sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}-musl.tar.gz"
+  SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${SINGBOX_TARBALL}"
+  SINGBOX_CACHE="$CACHE_DIR/$SINGBOX_TARBALL"
+  fetch_cached "$SINGBOX_URL" "$SINGBOX_CACHE" "sing-box $SINGBOX_VERSION ($SINGBOX_ARCH)" "$SINGBOX_SHA256"
+
+  log "解出 sing-box..."
+  SINGBOX_EXTRACT_DIR="$STAGE/.singbox-extract"
+  mkdir -p "$SINGBOX_EXTRACT_DIR"
+  tar -xzf "$SINGBOX_CACHE" -C "$SINGBOX_EXTRACT_DIR"
+  SINGBOX_BIN=$(find "$SINGBOX_EXTRACT_DIR" -type f -name sing-box | head -n 1)
+  if [ -z "$SINGBOX_BIN" ]; then
+    echo "ERROR: sing-box tarball 里找不到 sing-box 二进制" >&2
+    exit 1
+  fi
+  cp "$SINGBOX_BIN" "$STAGE/bin/sing-box"
+  chmod +x "$STAGE/bin/sing-box"
+  rm -rf "$SINGBOX_EXTRACT_DIR"
+fi
 
 # ---- 7. 构建期依赖守卫(P6 复审 Minor):确认 sing-box 二进制真正静态链接。
 # 上面第 6 步只是"下载了带 -musl 后缀的资产名",并不能保证 SagerNet 未来某天不会
@@ -351,13 +588,22 @@ cp "$ROOT/scripts/update.sh" "$STAGE/update.sh"
 chmod +x "$STAGE/update.sh"
 
 # ---- 9. meta.json ----
+# slim / nodeCompression / singboxBuild 让面板和排障能一眼看出这份产物是按哪种模式
+# 打的——"装上去是 60MB 还是 130MB"全取决于这几个值,不该只能翻 CI 日志才知道。
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+if [ "$SLIM" = "1" ]; then SLIM_JSON="true"; else SLIM_JSON="false"; fi
+if [ "$SLIM" = "1" ] && [ "$UPX" = "1" ]; then NODE_COMPRESSION="upx"; else NODE_COMPRESSION="none"; fi
+if [ "$SLIM" = "1" ]; then SINGBOX_BUILD="source-slim"; else SINGBOX_BUILD="official-release"; fi
 cat > "$STAGE/meta.json" <<EOF
 {
   "version": "$VERSION",
   "singboxVersion": "$SINGBOX_VERSION",
   "nodeVersion": "$NODE_VERSION",
   "arch": "$ARCH",
+  "slim": $SLIM_JSON,
+  "nodeCompression": "$NODE_COMPRESSION",
+  "singboxBuild": "$SINGBOX_BUILD",
+  "singboxTags": "$SINGBOX_TAGS",
   "builtAt": "$BUILT_AT"
 }
 EOF
@@ -390,3 +636,21 @@ log "完成: $VERSIONED_PATH"
 log "$(cat "$VERSIONED_PATH.sha256")"
 log "稳定资产名: $STABLE_PATH"
 log "$(cat "$STABLE_PATH.sha256")"
+
+# ---- 12. 体积报告 ----
+# 这次改造的核心指标就是"装到路由器上占多少",所以直接打在构建日志里:每个顶层目录
+# 的未压缩体积 + 单独压一次后的体积,外加整包。省得每次都把产物拉下来再 du 一遍,
+# 也方便在 CI 上直接看出哪次改动把体积吃回去了。
+report_sizes() {
+  log "体积明细(目录:未压缩 -> 单独 tar.gz 后,单位 MB)"
+  for entry in node panel bin openwrt; do
+    [ -e "$STAGE/$entry" ] || continue
+    raw_kb=$(du -sk "$STAGE/$entry" | awk '{print $1}')
+    packed_b=$(cd "$STAGE" && tar -czf - "$entry" 2>/dev/null | wc -c)
+    log "$(printf '  %-8s %7.1f  ->  %6.1f' "$entry" "$(awk -v k="$raw_kb" 'BEGIN {print k/1024}')" "$(awk -v b="$packed_b" 'BEGIN {print b/1048576}')")"
+  done
+  raw_kb=$(du -sk "$STAGE" 2>/dev/null | awk '{print $1}')
+  packed_kb=$(du -k "$VERSIONED_PATH" | awk '{print $1}')
+  log "$(printf '  %-8s %7.1f  ->  %6.1f  (%s)' "合计" "$(awk -v k="$raw_kb" 'BEGIN {print k/1024}')" "$(awk -v k="$packed_kb" 'BEGIN {print k/1024}')" "$(basename "$VERSIONED_PATH")")"
+}
+report_sizes

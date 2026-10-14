@@ -13,7 +13,12 @@ permissions:
   contents: read
 
 env:
-  OPENBOX_REPO: liandu2024/Open-Box
+  # 发布说明里那条安装命令指向哪个仓库,以及 install.sh 的默认下载源。
+  # 这是本 fork,所以指向自己:脚本与资产都在这个仓库里。
+  OPENBOX_REPO: xuzhike123/Open-Box
+  # build-release.sh 在 OPENBOX_SLIM=1(默认)下会用 Go 现场精简编译 sing-box;
+  # sing-box 的 go.mod 声明了 go 1.24.7,这里取 1.25 系列(>= 要求即可)。
+  GO_VERSION: '1.25'
 
 jobs:
   build:
@@ -31,6 +36,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      # 精简打包的两条构建期依赖(见 scripts/build-release.sh 头部"精简打包(SLIM)"):
+      #   - Go:现场把 sing-box 按精简 tag 编出来,替掉 40.8MB 的全功能发布资产
+      #   - upx:压缩 node/bin/node(93.8MB -> 约 28MB),这是整包里最大的一块
+      # 少任何一个,build-release.sh 都会在开头明确报错并告诉你该怎么关掉
+      # (OPENBOX_SLIM=0 / OPENBOX_UPX=0),不会打到一半才失败。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install upx
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq upx-ucl || sudo apt-get install -y -qq upx
+          upx --version
 
       - name: Enable Corepack
         run: corepack enable
@@ -62,6 +84,12 @@ jobs:
       - name: Build release tarball
         env:
           OPENBOX_VERSION: ${{ github.ref_name }}
+          # 走脚本内的默认值(都是 1);这里显式列出来,是为了让不碰代码也能在两个
+          # 仓库变量里把精简行为关掉:Settings → Secrets and variables → Variables。
+          #   OPENBOX_SLIM=0  → 打回完整包(解包约 167MB,小 flash 机型装不下)
+          #   OPENBOX_UPX=0   → 不压缩 node(包大 65MB 左右,但不额外吃运行时内存)
+          OPENBOX_SLIM: ${{ vars.OPENBOX_SLIM || '1' }}
+          OPENBOX_UPX: ${{ vars.OPENBOX_UPX || '1' }}
         run: bash scripts/build-release.sh ${{ matrix.arch }} dist-release
 
       # build-release.sh 每个架构都产出两份内容完全一致的 tarball(+sha256):带版本号
@@ -112,15 +140,21 @@ jobs:
           {
             echo "## Open-Box ${{ github.ref_name }}"
             echo ""
-            echo "- sing-box 内核版本:\`$SINGBOX_VERSION\`(musl 静态链接)"
+            echo "- sing-box 内核版本:\`$SINGBOX_VERSION\`(从源码按精简 tag 编译,musl 静态链接)"
             echo "- Node 运行时版本:\`$NODE_VERSION\`(musl 构建,glibc 版本在 OpenWrt 上无法运行)"
+            echo ""
+            echo "### 体积"
+            echo ""
+            echo "本仓库打的是**精简包**,面向 128MB NAND 的小 flash 路由器(如红米 AX6)。"
+            echo "解包后约 65~70MB,而完整包是约 167MB。逐项实测数据与取舍见"
+            echo "\`scripts/build-release.sh\` 头部的\"精简打包(SLIM)\"注释。"
             echo ""
             echo "### 硬件要求"
             echo ""
             echo "- CPU 架构:x86_64 或 arm64(aarch64)"
-            echo "- 可用存储:≥ 512MB"
-            echo "- 可用内存:≥ 512MB"
-            echo "- 系统:OpenWrt"
+            echo "- 可用存储:≥ 96MB(精简包;留出 data/ 规则集与统计的增长余量)"
+            echo "- 可用内存:≥ 512MB(UPX 压缩过的 node 启动时会多占几十 MB)"
+            echo "- 系统:OpenWrt(含 ImmortalWrt / iStoreOS)"
             echo ""
             echo "### 一键安装"
             echo ""
@@ -128,8 +162,8 @@ jobs:
             echo "# 直连版"
             echo "curl -fsSL https://raw.githubusercontent.com/${OPENBOX_REPO}/main/scripts/install.sh | sh"
             echo ""
-            echo "# 镜像加速版(把 <镜像前缀> 换成你信任的加速站点域名)"
-            echo "curl -fsSL https://<镜像前缀>/https://raw.githubusercontent.com/${OPENBOX_REPO}/main/scripts/install.sh | sh -s -- --mirror <镜像前缀>"
+            echo "# 镜像加速版(国内推荐:内置镜像列表会自动探测)"
+            echo "curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/${OPENBOX_REPO}/main/scripts/install.sh | sh -s -- --mirror"
             echo '```'
             echo ""
             echo "完整安装 / 升级 / 卸载说明见仓库根目录 README。"

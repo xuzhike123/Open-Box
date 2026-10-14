@@ -75,12 +75,15 @@ jobs:
         run: corepack pnpm install --frozen-lockfile
 
       # ImageBuilder 需要的宿主工具。ubuntu-24.04 runner 上大部分已有,这里补齐
-      # 容易缺的那几个;zstd 是解 .tar.zst 用的。
+      # 容易缺的那几个:
+      #   zstd            解 ImageBuilder 的 .tar.zst
+      #   squashfs-tools  提供 unsquashfs,build-firmware.sh 用它核对"打进镜像的
+      #                   root.squashfs 里到底有没有 /opt/open-box 那些文件"
       - name: Install ImageBuilder host tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq zstd build-essential libncurses-dev zlib1g-dev \
-            gawk gettext libssl-dev xsltproc rsync unzip wget file
+          sudo apt-get install -y -qq zstd squashfs-tools build-essential libncurses-dev \
+            zlib1g-dev gawk gettext libssl-dev xsltproc rsync unzip wget file
 
       - name: Build firmware image
         env:

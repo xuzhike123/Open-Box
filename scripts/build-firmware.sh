@@ -202,22 +202,35 @@ log "开始打镜像(这一步只装包 + 压缩 rootfs,通常 3~8 分钟)..."
 BUILT_DIR="$IB_DIR/bin/targets/$IMAGEBUILDER_TARGET/$IMAGEBUILDER_SUBTARGET"
 [ -d "$BUILT_DIR" ] || die "找不到镜像输出目录 $BUILT_DIR"
 
-# ---- 5. 自检:FILES 到底有没有真的进 rootfs ----
-# "镜像比基础镜像大"只能说明有事发生;这里直接去 ImageBuilder 装配好的 rootfs 里
-# 点名,比看体积有意义得多。TARGET_DIR 在 newer ImageBuilder 里构建完仍留在
-# build_dir 下,若某个版本把它清了就退化成警告,不误报失败。
-TARGET_DIR=$(find "$IB_DIR/build_dir" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -n 1)
-if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR/opt/open-box" ]; then
-  for f in bin/sing-box node/bin/node node/lib panel/server/index.mjs panel/dist/index.html; do
-    [ -e "$TARGET_DIR/opt/open-box/$f" ] || die "rootfs 里缺少 /opt/open-box/$f,FILES 没有正确铺进去"
-  done
-  for f in etc/init.d/openbox etc/init.d/openbox-panel etc/uci-defaults/99-openbox; do
-    [ -e "$TARGET_DIR/$f" ] || die "rootfs 里缺少 /$f"
-  done
-  log "rootfs 自检通过:/opt/open-box 与 init 脚本都在镜像里。"
-else
-  log "提示:没找到 ImageBuilder 的装配目录,跳过 rootfs 自检(不阻断)。"
-fi
+# ---- 5. 自检:确认 FILES 真的进了"要打进去的那个 rootfs" ----
+# 这里一开始写错了:去 build_dir 下找 ImageBuilder 的 TARGET_DIR,但它在 24.10 里是
+# build_dir/target-<arch>_<libc>/root-<profile>/,找错了一层就静默跳过——等于没检查。
+# 改成直接核对 ImageBuilder 刚生成的那个 root.squashfs:它就是会被写进 sysupgrade
+# 镜像的文件系统,拿它做断言才真正回答了"镜像里到底有什么"。
+SQUASHFS_IMG=$(find "$IB_DIR/build_dir" -type f -name 'root.squashfs' 2>/dev/null | head -n 1)
+[ -n "$SQUASHFS_IMG" ] || die "找不到 ImageBuilder 生成的 root.squashfs,无法核对镜像内容"
+command -v unsquashfs >/dev/null 2>&1 || \
+  die "需要 unsquashfs 来核对镜像内容(apt-get install -y squashfs-tools)"
+log "核对 $(basename "$SQUASHFS_IMG") 的内容..."
+SQUASHFS_LIST=$(unsquashfs -l "$SQUASHFS_IMG" 2>/dev/null) || die "无法列出 $SQUASHFS_IMG"
+for f in opt/open-box/bin/sing-box \
+         opt/open-box/node/bin/node \
+         opt/open-box/node/lib \
+         opt/open-box/panel/server/index.mjs \
+         opt/open-box/panel/dist/index.html \
+         opt/open-box/meta.json \
+         opt/open-box/uninstall.sh \
+         opt/open-box/update.sh \
+         etc/init.d/openbox \
+         etc/init.d/openbox-panel \
+         etc/uci-defaults/99-openbox \
+         www/luci-static/resources/view/openbox/status.js \
+         usr/share/luci/menu.d/luci-app-openbox.json \
+         usr/share/rpcd/acl.d/luci-app-openbox.json; do
+  printf '%s\n' "$SQUASHFS_LIST" | grep -q "/$f" || \
+    die "root.squashfs 里缺少 /$f —— FILES 没有正确铺进去,这个镜像不能刷"
+done
+log "root.squashfs 自检通过:/opt/open-box 与 init/LuCI 文件都在镜像里(共 $(printf '%s\n' "$SQUASHFS_LIST" | grep -c 'opt/open-box') 个相关条目)。"
 
 # 只挑 sysupgrade(升级/刷机都用它);factory 镜像是给第一次从原厂固件刷过去用的。
 IMG=$(find "$BUILT_DIR" -maxdepth 1 -type f -name "*${PROFILE}-squashfs-sysupgrade.bin" | head -n 1)

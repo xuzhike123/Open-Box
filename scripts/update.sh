@@ -48,10 +48,17 @@
 
 set -eu
 
-REPO="liandu2024/Open-Box"
+REPO="${OPENBOX_REPO:-xuzhike123/Open-Box}"
 INSTALL_ROOT="/opt/open-box"
-MIN_FREE_KB=$((512 * 1024))
-# /tmp 通常是 tmpfs(内存),这里只放下载下来的压缩包(实测约 78MB),留出安全余量;
+# 升级时的可用空间门槛。必须覆盖"新包解到 $INSTALL_ROOT/.update-stage.$$(见下方
+# Important 3)"这一份暂存体积——它和现有安装在同一文件系统上共存,所以峰值是
+# 旧安装 + 新安装,而不是只有新的那份。
+# 精简包解开约 65~70MB(见 scripts/build-release.sh 的"精简打包(SLIM)"一节),
+# 取 96MB 给暂存和 data/ 增长都留了余量。原来的 512MB 门槛会让这类小 flash 机型
+# 永远升不了级——正是本 fork 要解决的问题。可用 OPENBOX_MIN_FREE_MB 覆盖。
+MIN_FREE_MB="${OPENBOX_MIN_FREE_MB:-96}"
+MIN_FREE_KB=$((MIN_FREE_MB * 1024))
+# /tmp 通常是 tmpfs(内存),这里只放下载下来的压缩包(精简包实测约 38MB),留出安全余量;
 # 解包目标不在这里(见下方 Important 3),所以这个阈值不需要覆盖解包后的体积。
 MIN_TMP_DOWNLOAD_KB=$((100 * 1024))
 
@@ -702,7 +709,7 @@ check_storage() {
     ''|*[!0-9]*) die "无法检测可用存储空间(df 命令输出异常)。" ;;
   esac
   if [ "$kb" -lt "$MIN_FREE_KB" ]; then
-    die "可用存储不足:检测到约 $((kb / 1024))MB,升级至少需要 512MB 可用空间。"
+    die "可用存储不足:检测到约 $((kb / 1024))MB,升级至少需要 ${MIN_FREE_MB}MB 可用空间(新包要先在 $INSTALL_ROOT 下暂存一份再替换)。现有安装未改动,清理空间后重试即可;可用 OPENBOX_MIN_FREE_MB=<MB> 覆盖本门槛。"
   fi
 }
 

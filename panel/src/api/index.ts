@@ -52,7 +52,12 @@ export const fetchVersionAPI = () => {
 }
 export const isSingBox = computed(() => version.value?.includes('sing-box'))
 export const zashboardVersion = ref(__APP_VERSION__)
-const UI_RELEASES_API = 'https://api.github.com/repos/liandu2024/AnGe-ClashBoard/releases/latest'
+// 面板的"检查更新"原本指向上游闭源项目 liandu2024/AnGe-ClashBoard 的发布仓库。
+// 本仓库是 fork,继续指那边有两个问题:① 上游版本号比这里的 2.04 高,面板会一直
+// 提示"有新版";② 点下去拿的是别人的闭源构建,不是这个 fork 的东西。
+// 改指本仓库:还没有 Release 时 GitHub 返回 404,下面的 catch 会当成"无更新",
+// 不会报错——这正是 fork 在没有自己的发布时的期望行为。
+const UI_RELEASES_API = 'https://api.github.com/repos/xuzhike123/Open-Box/releases/latest'
 
 export const fetchBackendVersion = async () => {
   const { data } = await fetchVersionAPI()
